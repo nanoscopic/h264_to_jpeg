@@ -143,7 +143,7 @@ void tracker__read_headers( chunk_tracker *tracker, FILE *fh ) {
         chunk *c = read_chunk( fh );
         if( !c ) break;
         
-        if( c->type == 6 ) done = 1;
+        if( c->type == 6 ) done = 1; // 6 = SEI
         tracker__add_chunk( tracker, c );
     }
 }
@@ -223,7 +223,17 @@ int tracker__mynano__recv_frame( chunk_tracker *tracker, int n ) {
 }
 
 struct timespec *lastI = NULL, *nextI = NULL;
-
+char *naltypes[9] = {
+    NULL, // 0
+    NULL, // 1
+    NULL, // 2
+    NULL, // 3
+    NULL, // 4
+    NULL, // 5
+    "SEI", // 6
+    "SPS", // 7
+    "PPS" // 8
+};
 void dump_chunk( chunk *c ) {
     char t = c->type;
     int forbidden_zero_bit = ( t & 0x80 ) >> 7;
@@ -251,7 +261,12 @@ void dump_chunk( chunk *c ) {
                 printf(" Iframe - size: %li\n", (long) c->size );
             }
         }
-        else printf("nalu type: %i, size: %li\n", type, (long) c->size );
+        else {
+            if( type <= 9 && naltypes[type] ) {
+                printf("nalu type: %s, size: %li\n", naltypes[type], (long) c->size );
+            }
+            else printf("nalu type: %i, size: %li\n", type, (long) c->size );
+        }
     }
 }
 

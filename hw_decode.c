@@ -27,8 +27,6 @@ static enum AVPixelFormat hw_pix_fmt;
 
 static AVBufferRef *hw_device_ctx = NULL;
 
-int oneout = 0;
-
 static int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type) {
     int err = 0;
 
@@ -56,15 +54,41 @@ typedef struct myjpeg_s {
 myjpeg *raw_to_jpeg( tjhandle compressor, unsigned char * buffer, int w, int h, const char* outfilename, int linesize );
 void send_jpeg( myjpeg *jpeg, myzmq *dest );
 
+char strErr[200];
+
+int skip_frame( AVCodecContext *avctx, AVPacket *packet ) {
+    int ret = avcodec_send_packet(avctx, packet);
+    if (ret < 0) {
+        av_strerror( ret, strErr, 200 );
+        fprintf(stderr, "Error during decoding: %s\n", strErr);
+        goto SKIPFAIL;
+    }
+    AVFrame *frame = av_frame_alloc();
+    if( !frame ) {
+        fprintf(stderr, "Cannot alloc frame\n");
+        goto SKIPFAIL;
+    }
+    ret = avcodec_receive_frame( avctx, frame );
+    if( ret < 0 ) {
+        av_strerror( ret, strErr, 200 );
+        fprintf(stderr, "Error recv frame: %s\n", strErr);
+        goto SKIPFAIL;
+    }
+    av_packet_unref( packet );
+    return 1;
+  SKIPFAIL:
+    av_packet_unref( packet );
+    return 0;
+}
+
 myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *packet ) {
     AVFrame *frame = NULL, *frame2 = NULL;
     int size;
-    int ret = 0;
-
-    ret = avcodec_send_packet(avctx, packet);
+    int ret = avcodec_send_packet(avctx, packet);
     if (ret < 0) {
-        fprintf(stderr, "Error during decoding %i\n", ret);
-        return NULL;
+        av_strerror( ret, strErr, 200 );
+        fprintf(stderr, "Error during decoding: %s\n", strErr);
+        goto fail;
     }
 
     if (!(frame = av_frame_alloc()) || !(frame2 = av_frame_alloc())) {
@@ -72,19 +96,14 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-
-    oneout++;
     
     ret = avcodec_receive_frame(avctx, frame);
-    if( ( oneout % 3 ) != 0 ) goto fail;
+    av_packet_unref( packet );
+    packet = NULL;
     
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        av_frame_free( &frame );
-        av_frame_free( &frame2 );
-        return NULL;
-    }
-    else if (ret < 0) {
-        fprintf(stderr, "Error while decoding\n");
+    if( ret < 0 ) {
+        av_strerror( ret, strErr, 200 );
+        fprintf(stderr, "Error while decoding: %s\n", strErr);
         goto fail;
     }
 
@@ -110,13 +129,13 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
         frame3->data, frame3->linesize );
     
     myjpeg *jpeg = raw_to_jpeg( compressor, (unsigned char *) frame3->data[0], w, h, "test.jpg", frame3->linesize[0] );
-    
+    av_frame_free( &frame3 );
     return jpeg;
     
     fail:
     if( frame ) av_frame_free(&frame);
     if( frame2 ) av_frame_free(&frame2);
-
+    if( packet ) av_packet_unref( packet );
     return NULL;
 }
 
@@ -125,14 +144,19 @@ myjpeg *raw_to_jpeg( tjhandle compressor, unsigned char * buffer, int w, int h, 
     const int COLOR_COMPONENTS = 3;
     myjpeg *jpeg = calloc( sizeof( myjpeg ), 1 );
 
-    tjCompress2( compressor, buffer, w, linesize, h, TJPF_RGB, &jpeg->data, &jpeg->size, TJSAMP_420, JPEG_QUALITY, TJFLAG_FASTDCT );
-    
+    int res = tjCompress2( compressor, buffer, w, linesize, h, TJPF_RGB, &jpeg->data, &jpeg->size, TJSAMP_420, JPEG_QUALITY, TJFLAG_FASTDCT );
+    if( res == -1 ) {
+        printf("tjCompress2 failed\n");
+    }
     return jpeg;
 }
 
 void write_jpeg( myjpeg *jpeg, char *filename ) {
     if( filename ) {
         FILE *fh = fopen( filename, "wb" );
+        if( !fh ) {
+            fprintf(stderr,"Can't open %s for writing", filename );
+        }
         fwrite( jpeg->data, 1, jpeg->size, fh );
         fclose( fh );
     }
@@ -165,12 +189,15 @@ static int read_packet( void *opaque, uint8_t *buf, int buf_size ) {
     chunkleft -= tracker->pos;
     
     while( bufleft ) {
+        // We can't fit the chunk into the buffer; write some of it
         if( chunkleft > bufleft ) {
             chunkleft -= bufleft;
             memcpy( &buf[bufpos], &curchunk->data[ tracker->pos ], bufleft );
             tracker->pos += bufleft;
             return buf_size;            
         }
+        
+        // The chunk fits exactly. Write it into the buffer and return
         if( chunkleft == bufleft ) {
             memcpy( &buf[bufpos], &curchunk->data[ tracker->pos ], bufleft );
             tracker->curchunk = curchunk->next;
@@ -178,21 +205,25 @@ static int read_packet( void *opaque, uint8_t *buf, int buf_size ) {
             tracker->pos = 0;
             return buf_size;
         }
-        // chunkleft < bufleft
-        memcpy( &buf[bufpos], &curchunk->data[ tracker->pos ], chunkleft );
-        bufpos += chunkleft;
         
-        // shift to the next chunk
+        // The chunk is smaller than the buffer. Write it into the buffer and continue to next chunk
+        
+        // Write the chunk into the buffer
+        memcpy( &buf[bufpos], &curchunk->data[ tracker->pos ], chunkleft );
+        // Advance the buffer position
+        bufpos += chunkleft;
+        bufleft -= chunkleft;
+        
+        // Continue to the next chunk then delete the chunk we wrote into the buffer
         chunk *todel = curchunk;
         curchunk = curchunk->next;
         chunk__del( todel );
-        
         tracker->curchunk = curchunk;
         tracker->pos = 0;
-        
-        if( !curchunk ) return bufpos; // if no chunk is ready; just return what we have so far
-        
-        bufleft -= chunkleft;
+       
+        // If no chunk is ready; just return what we have so far
+        if( !curchunk ) return bufpos; 
+         
         chunkleft = curchunk->size;
     }
     return AVERROR_EOF; // unreachable...
@@ -225,7 +256,29 @@ AVFormatContext *new_memory_ctx( chunk_tracker **ret ) {
     return NULL;
 }
 
-// **** END BUFFER STUFF
+void setup_zmq_sockets( int argc, char **argv, myzmq **zmqIn, myzmq **zmqOut ) {
+    char *spec = argv[2];
+    *zmqIn = myzmq__new( spec, 1 ); // 1 means bind to socket
+    printf("Receiving data from zmq %s\n", spec );
+    
+    if( argc > 3 ) {
+        char *specOut = argv[3];
+        *zmqOut = myzmq__new( spec, 0 ); // 0 means connect to socket
+        printf("Send data to zmq %s\n", spec );
+    }
+}
+
+void setup_nanomsg_sockets( int argc, char **argv, int *nanoIn, int *nanoOut ) {
+    char *spec = argv[2];
+    *nanoIn = mynano__new( spec, 1 ); // 1 means bind to socket
+    printf("Receiving data from nanomsg %s\n", spec );
+    
+    if( argc > 3 ) {
+        char *specOut = argv[3];
+        *nanoOut = mynano__new( specOut, 0 ); // 0 means connect to socket
+        printf("Send data to nanomsg %s\n", specOut );
+    }
+}
 
 int main( int argc, char *argv[] ) {
     struct timespec main_start, loop_start, diff;
@@ -252,37 +305,14 @@ int main( int argc, char *argv[] ) {
     FILE *fh = NULL;
     if( !strncmp( argv[1], "zmq", 3 ) ) {
         mode = 1;
-        if( argc < 3 ) {
-            fprintf(stderr, "Usage: %s zmq <zmq spec to pull from> <zmq spec to push to>\n", argv[0] );
-            return -1;
-        }
+        if( argc < 3 ) { fprintf(stderr, "Usage: %s zmq <zmq spec to pull from> <zmq spec to push to>\n", argv[0] ); return -1; }
+        setup_zmq_sockets( argc, argv, &zmqIn, &zmqOut );
         
-        char *spec = argv[2];
-        zmqIn = myzmq__new( spec, 1 ); // 1 means bind to socket
-        printf("Receiving data from zmq %s\n", spec );
-        
-        if( argc > 3 ) {
-            char *specOut = argv[3];
-            zmqOut = myzmq__new( spec, 0 ); // 0 means connect to socket
-            printf("Send data to zmq %s\n", spec );
-        }
     }
     else if( !strncmp( argv[1], "nano", 4 ) ) {
         mode = 2;
-        if( argc < 3 ) {
-            fprintf(stderr, "Usage: %s nano <nanomsg spec to pull from> <nanomsg spec to push to>\n", argv[0] );
-            return -1;
-        }
-        
-        char *spec = argv[2];
-        nanoIn = mynano__new( spec, 1 ); // 1 means bind to socket
-        printf("Receiving data from nanomsg %s\n", spec );
-        
-        if( argc > 3 ) {
-            char *specOut = argv[3];
-            nanoOut = mynano__new( specOut, 0 ); // 0 means connect to socket
-            printf("Send data to nanomsg %s\n", specOut );
-        }
+        if( argc < 3 ) { fprintf(stderr, "Usage: %s nano <nanomsg spec to pull from> <nanomsg spec to push to>\n", argv[0] ); return -1; }
+        setup_nanomsg_sockets( argc, argv, &nanoIn, &nanoOut );
     }
     else {    
         fh = fopen( argv[1], "rb" );
@@ -298,25 +328,43 @@ int main( int argc, char *argv[] ) {
     else if( mode == 2 ) tracker__mynano__recv_headers( tracker, nanoIn );
     
     AVInputFormat *format = av_find_input_format("h264");
-    ret = avformat_open_input( &input_ctx, NULL, format, NULL );
-    if( ret != 0 ) {
-        fprintf( stderr, "Cannot open input; err=%i\n", ret );
+    if( !format ) {
+        fprintf( stderr, "Cannot find input format h264\n" );
         return -1;
     }
     
+    printf("Opening Input\n");
+    ret = avformat_open_input( &input_ctx, NULL, format, NULL );
+    if( ret != 0 ) {
+        char strErr[200];
+        av_strerror( ret, strErr, 200 );
+        fprintf( stderr, "Cannot open input; %s\n", strErr );
+        return -1;
+    }
+    printf("Input Open\n");
+    
+    //AVInputFormat *format2 = input_ctx->iformat;
+    //printf("Input format short: %s\n", format2->name );
+    
+    int gotframe = 1;
+    
+    printf("Fetching first frame to initialize decoder\n");
+    if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
+    else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
+    else if( mode == 2 ) tracker__mynano__recv_frame( tracker, nanoIn );
+    
+    // Find Stream Info doesn't "need" a first frame to function, but it complains if you don't give it one
+    if (avformat_find_stream_info(input_ctx, NULL) < 0) {
+        fprintf(stderr, "Cannot find input stream information.\n");
+        return -1;
+    }
+     
     AVCodec *decoder = NULL;
     int video_stream = av_find_best_stream( input_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     if( video_stream < 0 ) {
         fprintf(stderr, "Cannot find a video stream in the input file\n");
         return -1;
     }
-    
-    int gotframe = 0;
-    
-    printf("Fetching first frame to initialize decoder\n");
-    if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
-    else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
-    else if( mode == 2 ) tracker__mynano__recv_frame( tracker, nanoIn );
     
     int i;
     for( i = 0;; i++ ) {
@@ -358,28 +406,34 @@ int main( int argc, char *argv[] ) {
             
     printf("Time from start of main till video loop: %f\n", (double) timeElapsed / ( double ) 1000000 );
             
-    int frameCount = 1;
+    int frameCount = 0;
     while( ret >= 0 ) {
-        if( frameCount > 1 ) {
+        if( frameCount > 0 ) {
             if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
             else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
             else if( mode == 2 ) tracker__mynano__recv_frame( tracker, nanoIn );
         }
-        
-        frameCount++;
-        //if( !gotframe ) break;
-        
+        if( !gotframe ) break;
+        //printf("frame: %i\n", frameCount);
         if( ( ret = av_read_frame( input_ctx, &packet ) ) < 0 ) break;
 
         if( video_stream == packet.stream_index ) {
+            frameCount++;
+            if( frameSkip ) {
+                if( frameCount % frameSkip ) {
+                    av_packet_unref( &packet );
+                    continue;
+                }
+            }
             myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet );
             if( jpeg ) {
+                if( mode == 0 && frameCount == 2 ) write_jpeg( jpeg, "test.jpg" );
                 if( mode == 1 ) myzmq__send_jpeg( jpeg, zmqOut );
                 else if( mode == 2 ) mynano__send_jpeg( jpeg, nanoOut );
             }
         }
 
-        av_packet_unref(&packet);
+        
     }
     
     struct timespec loop_done;
