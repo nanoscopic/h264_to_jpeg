@@ -79,14 +79,18 @@ chunk *myzmq__recv_chunk( myzmq *z ) {
     c->size = size;
     c->data = malloc( size );
     c->type = buffer[4];
-    c->dtype = 1;
+    c->dtype = 2;
     memcpy( c->data, buffer, size );
     dump_chunk( c );
     return c;
 }
 
 void chunk__del( chunk *c ) {
+    if( !c ) return;
+    if( c->dtype == 0 ) free( c->data );
     if( c->dtype == 1 ) nn_freemsg( c->data );
+    if( c->dtype == 2 ) free( c->data );
+    free( c );
 }
 
 chunk *mynano__recv_chunk( int n ) {
@@ -123,6 +127,16 @@ void mynano__send( int n, void *data, int size ) {
 }
 
 chunk *read_chunk( FILE *fh );
+
+void tracker__del( chunk_tracker *tracker ) {
+    chunk *cur = tracker->curchunk;
+    while( cur ) {
+        chunk *next = cur->next;
+        chunk__del( cur );
+        cur = next;
+    }
+    free( tracker );
+}
 
 void tracker__add_chunk( chunk_tracker *tracker, chunk *c ) {
     chunk *curchunk = tracker->curchunk;

@@ -2,7 +2,7 @@ all: decode send
 
 decode: hw_decode.c tracker.h chunk.h ffmpeg
 	./brewser.pl installdeps brew_deps
-	gcc hw_decode.c -I/opt/libjpeg-turbo/include -L ffmpeg/lib -L/opt/libjpeg-turbo/lib -lavcodec -lavutil -lavformat -lturbojpeg -lswscale -lzmq -lnanomsg -o decode
+	gcc -g hw_decode.c -I/opt/libjpeg-turbo/include -L ffmpeg/lib -L/opt/libjpeg-turbo/lib -lavcodec -lavutil -lavformat -lturbojpeg -lswscale -lzmq -lnanomsg -o decode
 
 send: send_video.c tracker.h chunk.h
 	./brewser.pl installdeps brew_deps

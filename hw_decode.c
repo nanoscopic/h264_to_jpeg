@@ -1,11 +1,13 @@
 // Based on ffmpeg hw_decode.c example code
 // Copyright (c) 2020 David Helkowski
+// Original example code:
 // Copyright (c) 2017 Jun Zhao
 // Copyright (c) 2017 Kaixuan Liu
 
 #include <stdio.h>
 
 #include <libavcodec/avcodec.h>
+#include <libavcodec/videotoolbox.h>
 #include <libavformat/avformat.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/hwcontext.h>
@@ -16,6 +18,7 @@
 #include <turbojpeg.h>
 #include <VideoToolbox/VideoToolbox.h>
 #include <time.h>
+#include "uclop.h"
 
 int64_t timespecDiff(struct timespec *timeA_p, struct timespec *timeB_p) {
   return ((timeA_p->tv_sec * 1000000000) + timeA_p->tv_nsec) - ((timeB_p->tv_sec * 1000000000) + timeB_p->tv_nsec);
@@ -82,7 +85,6 @@ int skip_frame( AVCodecContext *avctx, AVPacket *packet ) {
 }
 
 myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *packet ) {
-    AVFrame *frame = NULL, *frame2 = NULL;
     int size;
     int ret = avcodec_send_packet(avctx, packet);
     if (ret < 0) {
@@ -91,15 +93,15 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
         goto fail;
     }
 
-    if (!(frame = av_frame_alloc()) || !(frame2 = av_frame_alloc())) {
+    AVFrame *frame = av_frame_alloc();
+    AVFrame *frame2 = av_frame_alloc();
+    if( !frame || !frame2 ) {
         fprintf(stderr, "Can not alloc frame\n");
         ret = AVERROR(ENOMEM);
         goto fail;
     }
     
     ret = avcodec_receive_frame(avctx, frame);
-    av_packet_unref( packet );
-    packet = NULL;
     
     if( ret < 0 ) {
         av_strerror( ret, strErr, 200 );
@@ -107,8 +109,12 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
         goto fail;
     }
 
-    frame2->format = AV_PIX_FMT_NV12;
-    av_hwframe_transfer_data(frame2, frame, 0 );
+    av_hwframe_transfer_data( frame2, frame, 0 );
+    
+    /*CVPixelBufferRef pix_buf = (CVPixelBufferRef)frame2->data[3];
+    OSType pixel_format = CVPixelBufferGetPixelFormatType(pix_buf);
+    const char *pixStr = av_get_pix_fmt_name( pixel_format );
+    printf("Decoded Pixel format: %s\n", pixStr );*/
     
     int w = frame2->width;
     int h = frame2->height;
@@ -128,14 +134,17 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
         (const uint8_t *const *) frame2->data, frame2->linesize, 0, h,
         frame3->data, frame3->linesize );
     
+    sws_freeContext( sws_ctx );
+    
     myjpeg *jpeg = raw_to_jpeg( compressor, (unsigned char *) frame3->data[0], w, h, "test.jpg", frame3->linesize[0] );
-    av_frame_free( &frame3 );
+    if( frame ) av_frame_free(&frame);
+    if( frame2 ) av_frame_free(&frame2);
+    if( frame3 ) av_frame_free( &frame3 );
     return jpeg;
     
     fail:
     if( frame ) av_frame_free(&frame);
     if( frame2 ) av_frame_free(&frame2);
-    if( packet ) av_packet_unref( packet );
     return NULL;
 }
 
@@ -175,8 +184,6 @@ void mynano__send_jpeg( myjpeg *jpeg, int n ) {
     tjFree( jpeg->data );
     free( jpeg );
 }
-
-// **** START BUFFER STUFF
 
 static int read_packet( void *opaque, uint8_t *buf, int buf_size ) {
     chunk_tracker *tracker = (chunk_tracker *) opaque;
@@ -256,40 +263,99 @@ AVFormatContext *new_memory_ctx( chunk_tracker **ret ) {
     return NULL;
 }
 
-void setup_zmq_sockets( int argc, char **argv, myzmq **zmqIn, myzmq **zmqOut ) {
-    char *spec = argv[2];
-    *zmqIn = myzmq__new( spec, 1 ); // 1 means bind to socket
-    printf("Receiving data from zmq %s\n", spec );
+void setup_zmq_sockets( ucmd *cmd, myzmq **zmqIn, myzmq **zmqOut ) {
+    char *specIn = ucmd__get(cmd,"--in");
+    *zmqIn = myzmq__new( specIn, 1 ); // 1 means bind to socket
+    printf("Receiving data from zmq %s\n", specIn );
     
-    if( argc > 3 ) {
-        char *specOut = argv[3];
-        *zmqOut = myzmq__new( spec, 0 ); // 0 means connect to socket
-        printf("Send data to zmq %s\n", spec );
+    char *specOut = ucmd__get(cmd,"--out");
+    if( specOut ) {
+        *zmqOut = myzmq__new( specOut, 0 ); // 0 means connect to socket
+        printf("Send data to zmq %s\n", specOut );
     }
 }
 
-void setup_nanomsg_sockets( int argc, char **argv, int *nanoIn, int *nanoOut ) {
-    char *spec = argv[2];
-    *nanoIn = mynano__new( spec, 1 ); // 1 means bind to socket
-    printf("Receiving data from nanomsg %s\n", spec );
+int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzmq *zmqOut, FILE *fh );
+
+void run_zmq( ucmd *cmd ) {
+    myzmq *zmqIn = NULL, *zmqOut = NULL;
+    setup_zmq_sockets( cmd, &zmqIn, &zmqOut );
+    run_stream( cmd, 1, 0, 0, zmqIn, zmqOut, NULL );
+}
+
+void setup_nanomsg_sockets( ucmd *cmd, int *nanoIn, int *nanoOut ) {
+  char *specIn = ucmd__get(cmd,"--in");
+    *nanoIn = mynano__new( specIn, 1 ); // 1 means bind to socket
+    printf("Receiving data from nanomsg %s\n", specIn );
     
-    if( argc > 3 ) {
-        char *specOut = argv[3];
+    char *specOut = ucmd__get(cmd,"--out");
+    if( specOut ) {
         *nanoOut = mynano__new( specOut, 0 ); // 0 means connect to socket
         printf("Send data to nanomsg %s\n", specOut );
     }
 }
 
+void run_nano( ucmd *cmd ) {
+    int nanoIn = 0, nanoOut = 0;
+    setup_nanomsg_sockets( cmd, &nanoIn, &nanoOut );
+    run_stream( cmd, 2, nanoIn, nanoOut, NULL, NULL, NULL );
+}
+
+void run_file( ucmd *cmd ) {
+    char *file = ucmd__get(cmd, "--file");
+    FILE *fh = fopen( file, "rb" );
+    if( !fh ) {
+        fprintf( stderr, "Cannot open input file '%s'\n", file );
+        return;
+    }
+    run_stream( cmd, 0, 0, 0, NULL, NULL, fh );
+}
+
 int main( int argc, char *argv[] ) {
+    uopt *file_options[] = {
+        UOPT_REQUIRED("--file","File to process"),
+        UOPT("--loops","Number of times to loop through the file"),
+        NULL
+    };
+    uopt *nano_options[] = {
+        UOPT_REQUIRED("--in","Nanomsg input spec"),
+        UOPT("--out","Nanomsg output spec"),
+        UOPT("--frameSkip","Frame skip mod; 2=half frames, 3=1/3 frames"),
+        NULL
+    };
+    uopt *zmq_options[] = {
+        UOPT_REQUIRED("--in","Zeromq input spec"),
+        UOPT("--out","Zeromq output spec"),
+        UOPT("--frameSkip","Frame skip mod; 2=half frames, 3=1/3 frames"),
+        NULL
+    };
+    uclop *opts = uclop__new( NULL, NULL );
+    uclop__addcmd( opts, "file", "Process a file", &run_file, file_options );
+    uclop__addcmd( opts, "nano", "Stream using nanomsg", &run_nano, nano_options );
+    uclop__addcmd( opts, "zmq", "Stream using zmq", &run_zmq, zmq_options );
+    uclop__run( opts, argc, argv );
+}
+
+int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzmq *zmqOut, FILE *fh ) {
+    int frameSkip = 0;
+    char *frameSkipC = ucmd__get( cmd, "--frameskip" );
+    if( frameSkipC ) {
+        frameSkip = atoi( frameSkipC );
+    }
+    
+    int loops = 1;
+    int loop = 1;
+    char *loopsC = ucmd__get( cmd, "--loops" );
+    if( loopsC ) {
+        loops = atoi( loopsC );
+        printf("Parsing file %i times\n", loops );
+    }
+  
+    // mode 0->file, 1->zmq, 2->nanomsg
     struct timespec main_start, loop_start, diff;
     clock_gettime(CLOCK_MONOTONIC, &main_start);
     int ret;
     
-    if( argc < 2 ) {
-        fprintf(stderr, "Usage: %s <input file>\n", argv[0]);
-        return -1;
-    }
-
     enum AVHWDeviceType type = av_hwdevice_find_type_by_name( "videotoolbox" );
     if( type == AV_HWDEVICE_TYPE_NONE ) {
         fprintf( stderr, "Cannot find videotoolbox hw decoder.\n" );
@@ -298,29 +364,6 @@ int main( int argc, char *argv[] ) {
     
     chunk_tracker *tracker;
     AVFormatContext *input_ctx = new_memory_ctx( &tracker );
-    
-    myzmq *zmqIn = NULL, *zmqOut = NULL;
-    int nanoIn = 0, nanoOut = 0;
-    char mode = 0; // 0->file, 1->zmq, 2->nanomsg
-    FILE *fh = NULL;
-    if( !strncmp( argv[1], "zmq", 3 ) ) {
-        mode = 1;
-        if( argc < 3 ) { fprintf(stderr, "Usage: %s zmq <zmq spec to pull from> <zmq spec to push to>\n", argv[0] ); return -1; }
-        setup_zmq_sockets( argc, argv, &zmqIn, &zmqOut );
-        
-    }
-    else if( !strncmp( argv[1], "nano", 4 ) ) {
-        mode = 2;
-        if( argc < 3 ) { fprintf(stderr, "Usage: %s nano <nanomsg spec to pull from> <nanomsg spec to push to>\n", argv[0] ); return -1; }
-        setup_nanomsg_sockets( argc, argv, &nanoIn, &nanoOut );
-    }
-    else {    
-        fh = fopen( argv[1], "rb" );
-        if( !fh ) {
-            fprintf( stderr, "Cannot open input file '%s'\n", argv[1] );
-            return -1;
-        }
-    }
     
     printf("Fetching headers to start decoder\n");
     if( mode == 0 ) tracker__read_headers( tracker, fh );
@@ -342,9 +385,6 @@ int main( int argc, char *argv[] ) {
         return -1;
     }
     printf("Input Open\n");
-    
-    //AVInputFormat *format2 = input_ctx->iformat;
-    //printf("Input format short: %s\n", format2->name );
     
     int gotframe = 1;
     
@@ -375,19 +415,22 @@ int main( int argc, char *argv[] ) {
         }
         if( config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == type ) {
             hw_pix_fmt = config->pix_fmt;
-            const char *pixStr = av_get_pix_fmt_name( hw_pix_fmt );
+            //const char *pixStr = av_get_pix_fmt_name( hw_pix_fmt );
+            //printf("Pixel format name: %s\n", pixStr );
             break;
         }
     }
     
     AVCodecContext *decoder_ctx = avcodec_alloc_context3( decoder );
+    
     if( !decoder_ctx ) return AVERROR( ENOMEM );
-
+    
     AVStream *video = input_ctx->streams[ video_stream ];
     if( avcodec_parameters_to_context( decoder_ctx, video->codecpar ) < 0 ) return -1;
-
+    
     decoder_ctx->get_format  = get_hw_format;
-
+    // pixel format becomes AV_PIX_FMT_VIDEOTOOLBOX
+    
     if( hw_decoder_init(decoder_ctx, type) < 0 ) return -1;
 
     if( avcodec_open2( decoder_ctx, decoder, NULL ) < 0 ) {
@@ -405,7 +448,7 @@ int main( int argc, char *argv[] ) {
     uint64_t timeElapsed = timespecDiff(&loop_start, &main_start);
             
     printf("Time from start of main till video loop: %f\n", (double) timeElapsed / ( double ) 1000000 );
-            
+    
     int frameCount = 0;
     while( ret >= 0 ) {
         if( frameCount > 0 ) {
@@ -413,8 +456,16 @@ int main( int argc, char *argv[] ) {
             else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
             else if( mode == 2 ) tracker__mynano__recv_frame( tracker, nanoIn );
         }
-        if( !gotframe ) break;
-        //printf("frame: %i\n", frameCount);
+        if( !gotframe ) {
+            if( mode != 0 ) break;
+            if( loops > loop ) {
+                loop++;
+                printf("Starting loop %i\n", loop );
+                fseek( fh, 0, SEEK_SET );
+                tracker__read_headers( tracker, fh );
+                continue;
+            }
+        }
         if( ( ret = av_read_frame( input_ctx, &packet ) ) < 0 ) break;
 
         if( video_stream == packet.stream_index ) {
@@ -427,13 +478,19 @@ int main( int argc, char *argv[] ) {
             }
             myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet );
             if( jpeg ) {
-                if( mode == 0 && frameCount == 2 ) write_jpeg( jpeg, "test.jpg" );
+                if( mode == 0 ) {
+                    if( frameCount == 2 ) write_jpeg( jpeg, "test.jpg" );
+                    else {
+                        tjFree( jpeg->data );
+                        free( jpeg );
+                    }
+                }
                 if( mode == 1 ) myzmq__send_jpeg( jpeg, zmqOut );
                 else if( mode == 2 ) mynano__send_jpeg( jpeg, nanoOut );
             }
         }
-
         
+        av_packet_unref(&packet);
     }
     
     struct timespec loop_done;
@@ -446,7 +503,7 @@ int main( int argc, char *argv[] ) {
     printf("Total framecount: %i\n", frameCount );
     printf("Time per frame (ms): %f\n", (double) timeElapsed2 / ( double ) 1000000 / (double) frameCount );
     
-    /* flush the decoder */
+    // flush the decoder
     packet.data = NULL;
     packet.size = 0;
     
@@ -456,8 +513,6 @@ int main( int argc, char *argv[] ) {
     
     tjDestroy(compressor);
     
-    av_packet_unref(&packet);
-
     avcodec_free_context(&decoder_ctx);
     avformat_close_input(&input_ctx);
     av_buffer_unref(&hw_device_ctx);
