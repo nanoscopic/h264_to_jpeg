@@ -2,7 +2,11 @@ all: decode send
 
 decode: hw_decode.c tracker.h chunk.h ffmpeg
 	./brewser.pl installdeps brew_deps
-	gcc -g hw_decode.c -I/opt/libjpeg-turbo/include -L ffmpeg/lib -L/opt/libjpeg-turbo/lib -lavcodec -lavutil -lavformat -lturbojpeg -lswscale -lzmq -lnanomsg -o decode
+	gcc -g hw_decode.c -I ffmpeg/include -I /opt/libjpeg-turbo/include -L ffmpeg/lib -L/opt/libjpeg-turbo/lib -lavcodec -lavutil -lavformat -lturbojpeg -lswscale -lzmq -lnanomsg -o decode
+	install_name_tool -change "/usr/local/lib/libavcodec.58.dylib" "@executable_path/ffmpeg/lib/libavcodec.58.dylib" decode
+	install_name_tool -change "/usr/local/lib/libavformat.58.dylib" "@executable_path/ffmpeg/lib/libavformat.58.dylib" decode
+	install_name_tool -change "/usr/local/lib/libavutil.56.dylib" "@executable_path/ffmpeg/lib/libavutil.56.dylib" decode
+	install_name_tool -change "/usr/local/lib/libswscale.5.dylib" "@executable_path/ffmpeg/lib/libswscale.5.dylib" decode
 
 send: send_video.c tracker.h chunk.h
 	./brewser.pl installdeps brew_deps
@@ -14,6 +18,19 @@ ffmpeg-for-h264_to_jpeg.tgz:
 ffmpeg: ffmpeg-for-h264_to_jpeg.tgz
 	mkdir ffmpeg
 	tar xf ffmpeg-for-h264_to_jpeg.tgz -C ffmpeg
+	ln -s libavcodec.58.dylib ffmpeg/lib/libavcodec.dylib
+	ln -s libavformat.58.dylib ffmpeg/lib/libavformat.dylib
+	ln -s libavutil.56.dylib ffmpeg/lib/libavutil.dylib
+	ln -s libswscale.5.dylib ffmpeg/lib/libswscale.dylib
+	ln -s libswresample.3.dylib ffmpeg/lib/libswresample.dylib
+	install_name_tool -change "/usr/local/lib/libswresample.3.dylib" "@executable_path/ffmpeg/lib/libswresample.3.dylib" ffmpeg/lib/libswscale.5.dylib
+	install_name_tool -change "/usr/local/lib/libswresample.3.dylib" "@executable_path/ffmpeg/lib/libswresample.3.dylib" ffmpeg/lib/libavformat.58.dylib
+	install_name_tool -change "/usr/local/lib/libswresample.3.dylib" "@executable_path/ffmpeg/lib/libswresample.3.dylib" ffmpeg/lib/libavcodec.58.dylib
+	install_name_tool -change "/usr/local/lib/libavutil.56.dylib" "@executable_path/ffmpeg/lib/libavutil.56.dylib" ffmpeg/lib/libavcodec.58.dylib
+	install_name_tool -change "/usr/local/lib/libavutil.56.dylib" "@executable_path/ffmpeg/lib/libavutil.56.dylib" ffmpeg/lib/libswresample.3.dylib
+	install_name_tool -change "/usr/local/lib/libavutil.56.dylib" "@executable_path/ffmpeg/lib/libavutil.56.dylib" ffmpeg/lib/libswscale.5.dylib
+	install_name_tool -change "/usr/local/lib/libavutil.56.dylib" "@executable_path/ffmpeg/lib/libavutil.56.dylib" ffmpeg/lib/libavformat.58.dylib
+	install_name_tool -change "/usr/local/lib/libavcodec.58.dylib" "@executable_path/ffmpeg/lib/libavcodec.58.dylib" ffmpeg/lib/libavformat.58.dylib
 
 clean:
 	rm -rf ffmpeg

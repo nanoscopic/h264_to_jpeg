@@ -19,6 +19,7 @@
 #include <VideoToolbox/VideoToolbox.h>
 #include <time.h>
 #include "uclop.h"
+#include <unistd.h>
 
 int64_t timespecDiff(struct timespec *timeA_p, struct timespec *timeB_p) {
   return ((timeA_p->tv_sec * 1000000000) + timeA_p->tv_nsec) - ((timeB_p->tv_sec * 1000000000) + timeB_p->tv_nsec);
@@ -321,6 +322,8 @@ int main( int argc, char *argv[] ) {
         UOPT_REQUIRED("--in","Nanomsg input spec"),
         UOPT("--out","Nanomsg output spec"),
         UOPT("--frameSkip","Frame skip mod; 2=half frames, 3=1/3 frames"),
+        UOPT("--cacheid","ID to cache headers under"),
+        UOPT("--cachedir","Dir to store cache files in"),
         NULL
     };
     uopt *zmq_options[] = {
@@ -365,10 +368,40 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     chunk_tracker *tracker;
     AVFormatContext *input_ctx = new_memory_ctx( &tracker );
     
+    char usedCache = 0;
     printf("Fetching headers to start decoder\n");
     if( mode == 0 ) tracker__read_headers( tracker, fh );
     else if( mode == 1 ) tracker__myzmq__recv_headers( tracker, zmqIn );
-    else if( mode == 2 ) tracker__mynano__recv_headers( tracker, nanoIn );
+    else if( mode == 2 ) {
+        char *cacheId = ucmd__get( cmd, "--cacheid" );
+        if( !cacheId ) tracker__mynano__recv_headers( tracker, nanoIn );
+        else {
+            char *cacheDir = ucmd__get( cmd, "--cachedir" );
+            if( !cacheDir ) cacheDir = "cache";
+            char cacheFile[100];
+            snprintf( cacheFile, 100, "%s/%s", cacheDir, cacheId );
+            if( access( cacheFile, F_OK ) != -1 ) {
+                printf("Using cached headers from %s\n", cacheFile );
+                // cache exists; use it
+                FILE *fh = fopen( cacheFile, "rb" );
+                tracker__read_headers( tracker, fh );
+                fclose( fh );
+                usedCache = 1;
+            }
+            else {
+                // cache doesn't exist; read headers then store them
+                printf("Caching headers at %s\n", cacheFile );
+                char res = tracker__mynano__recv_headers( tracker, nanoIn );
+                if( res == 0 ) {
+                    fprintf(stderr,"Did not recieve headers; cannot continue\n");
+                    exit(1);
+                }
+                FILE *fh = fopen( cacheFile, "wb+" );
+                tracker__write_file( tracker, fh );
+                fclose( fh );
+            }
+        }
+    }
     
     AVInputFormat *format = av_find_input_format("h264");
     if( !format ) {
@@ -391,14 +424,19 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     printf("Fetching first frame to initialize decoder\n");
     if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
     else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
-    else if( mode == 2 ) tracker__mynano__recv_frame( tracker, nanoIn );
+    else if( mode == 2 ) {
+        if( usedCache ) tracker__mynano__recv_frame_non_header( tracker, nanoIn );
+        else tracker__mynano__recv_frame( tracker, nanoIn );
+    }
     
     // Find Stream Info doesn't "need" a first frame to function, but it complains if you don't give it one
+    printf("Finding stream info\n");
     if (avformat_find_stream_info(input_ctx, NULL) < 0) {
         fprintf(stderr, "Cannot find input stream information.\n");
         return -1;
     }
      
+    printf("Finding best stream\n");
     AVCodec *decoder = NULL;
     int video_stream = av_find_best_stream( input_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     if( video_stream < 0 ) {
@@ -406,6 +444,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
         return -1;
     }
     
+    printf("Getting hardware config\n");
     int i;
     for( i = 0;; i++ ) {
         const AVCodecHWConfig *config = avcodec_get_hw_config( decoder, i );
@@ -431,6 +470,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     decoder_ctx->get_format  = get_hw_format;
     // pixel format becomes AV_PIX_FMT_VIDEOTOOLBOX
     
+    printf("Initiating decoder\n");
     if( hw_decoder_init(decoder_ctx, type) < 0 ) return -1;
 
     if( avcodec_open2( decoder_ctx, decoder, NULL ) < 0 ) {
@@ -454,7 +494,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
         if( frameCount > 0 ) {
             if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
             else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
-            else if( mode == 2 ) tracker__mynano__recv_frame( tracker, nanoIn );
+            else if( mode == 2 ) tracker__mynano__recv_frame_non_header( tracker, nanoIn );
         }
         if( !gotframe ) {
             if( mode != 0 ) break;

@@ -7,6 +7,7 @@ typedef struct chunk_tracker_s {
 
 struct chunk_s {
     char type;
+    char easyType;
     char *data;
     uint32_t size;
     chunk *next;

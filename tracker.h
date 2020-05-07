@@ -7,7 +7,9 @@
 
 #include "chunk.h"
 
-void dump_chunk( chunk *c );
+void chunk__dump( chunk *c );
+char chunk__isheader( chunk *c );
+chunk *read_chunk_non_header( FILE *fh );
 
 typedef struct myzmq_s {
     void *context;
@@ -81,7 +83,7 @@ chunk *myzmq__recv_chunk( myzmq *z ) {
     c->type = buffer[4];
     c->dtype = 2;
     memcpy( c->data, buffer, size );
-    dump_chunk( c );
+    chunk__dump( c );
     return c;
 }
 
@@ -105,8 +107,9 @@ chunk *mynano__recv_chunk( int n ) {
     c->size = size;
     c->data = buf;
     c->type = buf[4];
+    c->dtype = 1;
     //printf("%x %x %x %x %x\n", buffer[0], buffer[1], buffer[2], buffer[3], buffer[4] );
-    dump_chunk( c );
+    chunk__dump( c );
     return c;
 }
 
@@ -162,6 +165,17 @@ void tracker__read_headers( chunk_tracker *tracker, FILE *fh ) {
     }
 }
 
+void chunk__write( chunk *c, FILE *fh );
+
+void tracker__write_file( chunk_tracker *tracker, FILE *fh ) {
+    chunk *cur = tracker->curchunk;
+    while( cur ) {
+        chunk *next = cur->next;
+        chunk__write( cur, fh );
+        cur = next;
+    }
+}
+
 void tracker__myzmq__send_chunks( chunk_tracker *tracker, myzmq *z ) {
     chunk *c = tracker->curchunk;
     while( c ) {
@@ -194,20 +208,33 @@ void tracker__myzmq__recv_headers( chunk_tracker *tracker, myzmq *z ) {
     }
 }
 
-void tracker__mynano__recv_headers( chunk_tracker *tracker, int n ) {
-    int done = 0;
-    while( !done ) {
+
+//"SEI", // 6
+//"SPS", // 7
+//"PPS"  // 8
+char tracker__mynano__recv_headers( chunk_tracker *tracker, int n ) {
+    char gotSei = 0;
+    char gotSps = 0;
+    char gotPps = 0;
+    while( !gotSei || !gotSps || !gotPps ) {
         chunk *c = mynano__recv_chunk( n );
         if( !c ) break;
         if( c->type == 0 ) continue; // dummy chunk to initialize zmq
         
-        if( c->type == 6 ) done = 1;
+        if( c->easyType == 6 ) gotSei = 1;
+        else if( c->easyType == 7 ) gotSps = 1;
+        else if( c->easyType == 8 ) gotPps = 1;
+        else {
+            printf("Got chunk type %i while trying to receive headers\n", c->easyType );
+            return 0;
+        }
         tracker__add_chunk( tracker, c );
     }
+    return 1;
 }
 
 int tracker__read_frame( chunk_tracker *tracker, FILE *fh ) {
-    chunk *c = read_chunk( fh );
+    chunk *c = read_chunk_non_header( fh );
     if( c ) {
         tracker__add_chunk( tracker, c );
         return 1;
@@ -230,9 +257,25 @@ int tracker__mynano__recv_frame( chunk_tracker *tracker, int n ) {
     chunk *c = mynano__recv_chunk( n );
     if( c ) {
         tracker__add_chunk( tracker, c );
+        //printf("Frame type %i\n", c->easyType );
         return 1;
     }
     printf("Could not fetch frame chunk\n");
+    return 0;
+}
+
+int tracker__mynano__recv_frame_non_header( chunk_tracker *tracker, int n ) {
+    while( 1 ) {
+        chunk *c = mynano__recv_chunk( n );
+        if( !c ) {
+            printf("Could not fetch frame chunk\n");
+            return 0;
+        }
+        if( chunk__isheader( c ) ) continue;
+        tracker__add_chunk( tracker, c );
+        return 1;
+    }
+    //unreachable
     return 0;
 }
 
@@ -248,11 +291,19 @@ char *naltypes[9] = {
     "SPS", // 7
     "PPS" // 8
 };
-void dump_chunk( chunk *c ) {
+char chunk__isheader( chunk *c ) {
     char t = c->type;
     int forbidden_zero_bit = ( t & 0x80 ) >> 7;
     int ref_idc = ( t & 0x60 ) >> 5;
     int type = ( t & 0x1F );
+    return ( type == 6 || type == 7 || type == 8 );
+}
+void chunk__dump( chunk *c ) {
+    char t = c->type;
+    int forbidden_zero_bit = ( t & 0x80 ) >> 7;
+    int ref_idc = ( t & 0x60 ) >> 5;
+    int type = ( t & 0x1F );
+    c->easyType = type;
     if( type == 1 ) {
         //if( ref_idc ) printf(".");
         //else printf("x");
@@ -300,11 +351,51 @@ chunk *read_chunk( FILE *fh ) {
         c->data = chunkdata;
         c->type = chunkdata[4];
         c->size = size + 4;
-        dump_chunk( c );
+        c->dtype = 0;
+        chunk__dump( c );
         return c;
     }
     fprintf(stderr, "not magic; not a good sign\n");
     return NULL;
+}
+
+chunk *read_chunk_non_header( FILE *fh ) {
+    char m[4];
+    while( 1 ) {
+        int read = fread( m, 4, 1, fh );
+        if( !read ) return NULL;
+        if( m[0] == 0x00 && m[1] == 0x00 && m[2] == 0x00 && m[3] == 0x01 ) {
+            unsigned char data[4];
+            fread( data, 4, 1, fh );
+            uint32_t size = (data[3]<<0) | (data[2]<<8) | (data[1]<<16) | (data[0]<<24);
+            
+            char *chunkdata = malloc( size + 4 );
+            chunkdata[0] = 0x00; chunkdata[1] = 0x00; chunkdata[2] = 0x00; chunkdata[3] = 0x01;
+            fread( &chunkdata[4], size, 1, fh );
+            chunk *c = calloc( sizeof( chunk ), 1 );
+            c->data = chunkdata;
+            c->type = chunkdata[4];
+            c->size = size + 4;
+            c->dtype = 0;
+            chunk__dump( c );
+            if( !chunk__isheader( c ) ) return c;
+        }
+    }
+    // unreachable
+    return NULL;
+}
+
+void chunk__write( chunk *c, FILE *fh ) {
+    char m[4] = { 0,0,0,0x01 };
+    fwrite( m, 1, 4, fh );
+    char sz[4];
+    long int datasize = c->size;
+    sz[0] = ( datasize & 0xFF000000 ) >> 24;
+    sz[1] = ( datasize & 0x00FF0000 ) >> 16;
+    sz[2] = ( datasize & 0x0000FF00 ) >> 8;
+    sz[3] = datasize & 0xFF;
+    fwrite( sz, 1, 4, fh );
+    fwrite( &c->data[4], 1, datasize, fh );  
 }
 
 chunk_tracker *tracker__new() {
