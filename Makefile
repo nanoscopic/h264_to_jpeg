@@ -2,7 +2,7 @@ all: decode send
 
 decode: hw_decode.c tracker.h chunk.h ffmpeg
 	./brewser.pl installdeps brew_deps
-	gcc -g hw_decode.c -I ffmpeg/include -I /opt/libjpeg-turbo/include -L ffmpeg/lib -L/opt/libjpeg-turbo/lib -lavcodec -lavutil -lavformat -lturbojpeg -lswscale -lzmq -lnanomsg -o decode
+	gcc -g hw_decode.c -I ffmpeg/include -I /usr/local/opt/libjpeg-turbo/include -L ffmpeg/lib -L/usr/local/opt/libjpeg-turbo/lib -lavcodec -lavutil -lavformat -lturbojpeg -lswscale -lzmq -lnanomsg -o decode
 	install_name_tool -change "/usr/local/lib/libavcodec.58.dylib" "@executable_path/ffmpeg/lib/libavcodec.58.dylib" decode
 	install_name_tool -change "/usr/local/lib/libavformat.58.dylib" "@executable_path/ffmpeg/lib/libavformat.58.dylib" decode
 	install_name_tool -change "/usr/local/lib/libavutil.56.dylib" "@executable_path/ffmpeg/lib/libavutil.56.dylib" decode
