@@ -1,8 +1,8 @@
 all: decode send
 
-decode: hw_decode.c tracker.h chunk.h ffmpeg
+decode: hw_decode.c tracker.h chunk.h ffmpeg ujsonin/ujsonin.c ujsonin/ujsonin.h
 	./brewser.pl installdeps brew_deps
-	gcc -g hw_decode.c -I ffmpeg/include -I /usr/local/opt/libjpeg-turbo/include -L ffmpeg/lib -L/usr/local/opt/libjpeg-turbo/lib -lavcodec -lavutil -lavformat -lturbojpeg -lswscale -lzmq -lnanomsg -o decode
+	gcc -g hw_decode.c ujsonin/ujsonin.c ujsonin/red_black_tree.c ujsonin/string-tree.c -I ffmpeg/include -I /usr/local/opt/libjpeg-turbo/include -L ffmpeg/lib -L/usr/local/opt/libjpeg-turbo/lib -lavcodec -lavutil -lavformat -lturbojpeg -lswscale -lzmq -lnanomsg -o decode
 	install_name_tool -change "/usr/local/lib/libavcodec.58.dylib" "@executable_path/ffmpeg/lib/libavcodec.58.dylib" decode
 	install_name_tool -change "/usr/local/lib/libavformat.58.dylib" "@executable_path/ffmpeg/lib/libavformat.58.dylib" decode
 	install_name_tool -change "/usr/local/lib/libavutil.56.dylib" "@executable_path/ffmpeg/lib/libavutil.56.dylib" decode
@@ -10,7 +10,7 @@ decode: hw_decode.c tracker.h chunk.h ffmpeg
 
 send: send_video.c tracker.h chunk.h
 	./brewser.pl installdeps brew_deps
-	gcc send_video.c -lzmq -lnanomsg -o send
+	gcc send_video.c ujsonin/ujsonin.c ujsonin/red_black_tree.c ujsonin/string-tree.c -lzmq -lnanomsg -o send
 
 ffmpeg-for-h264_to_jpeg.tgz:
 	wget https://github.com/nanoscopic/ffmpeg/releases/download/v1.0/ffmpeg-for-h264_to_jpeg.tgz

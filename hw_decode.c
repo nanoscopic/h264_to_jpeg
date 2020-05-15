@@ -20,6 +20,8 @@
 #include <time.h>
 #include "uclop.h"
 #include <unistd.h>
+#include <sys/time.h>
+#include "ujsonin/ujsonin.h"
 
 int64_t timespecDiff(struct timespec *timeA_p, struct timespec *timeB_p) {
   return ((timeA_p->tv_sec * 1000000000) + timeA_p->tv_nsec) - ((timeB_p->tv_sec * 1000000000) + timeB_p->tv_nsec);
@@ -85,7 +87,7 @@ int skip_frame( AVCodecContext *avctx, AVPacket *packet ) {
     return 0;
 }
 
-myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *packet ) {
+myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *packet, uint64_t frameTime, char skip ) {
     int size;
     int ret = avcodec_send_packet(avctx, packet);
     if (ret < 0) {
@@ -103,6 +105,15 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
     }
     
     ret = avcodec_receive_frame(avctx, frame);
+    
+    if( skip ) {
+        uint64_t now = now_msec();
+        uint64_t dif = now - frameTime;
+        printf("MS till drop: %lli\n", (long long) dif );
+        if( frame ) av_frame_free(&frame);
+        if( frame2 ) av_frame_free(&frame2);
+        return NULL;
+    }
     
     if( ret < 0 ) {
         av_strerror( ret, strErr, 200 );
@@ -141,6 +152,11 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
     if( frame ) av_frame_free(&frame);
     if( frame2 ) av_frame_free(&frame2);
     if( frame3 ) av_frame_free( &frame3 );
+    
+    uint64_t now = now_msec();
+    uint64_t dif = now - frameTime;
+    printf("MS till jpeg: %lli\n", (long long) dif );
+    
     return jpeg;
     
     fail:
@@ -340,8 +356,10 @@ int main( int argc, char *argv[] ) {
 }
 
 int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzmq *zmqOut, FILE *fh ) {
+    ujsonin_init();
+  
     int frameSkip = 0;
-    char *frameSkipC = ucmd__get( cmd, "--frameskip" );
+    char *frameSkipC = ucmd__get( cmd, "--frameSkip" );
     if( frameSkipC ) {
         frameSkip = atoi( frameSkipC );
     }
@@ -425,7 +443,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
     else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
     else if( mode == 2 ) {
-        if( usedCache ) tracker__mynano__recv_frame_non_header( tracker, nanoIn );
+        if( usedCache ) tracker__mynano__recv_frame_non_header( tracker, nanoIn, NULL );
         else tracker__mynano__recv_frame( tracker, nanoIn );
     }
     
@@ -490,11 +508,12 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     printf("Time from start of main till video loop: %f\n", (double) timeElapsed / ( double ) 1000000 );
     
     int frameCount = 0;
+    uint64_t frameTime;
     while( ret >= 0 ) {
         if( frameCount > 0 ) {
             if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
             else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
-            else if( mode == 2 ) tracker__mynano__recv_frame_non_header( tracker, nanoIn );
+            else if( mode == 2 ) tracker__mynano__recv_frame_non_header( tracker, nanoIn, &frameTime );
         }
         if( !gotframe ) {
             if( mode != 0 ) break;
@@ -510,13 +529,15 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
 
         if( video_stream == packet.stream_index ) {
             frameCount++;
+            char skipThisFrame = 0;
             if( frameSkip ) {
                 if( frameCount % frameSkip ) {
-                    av_packet_unref( &packet );
-                    continue;
+                    //av_packet_unref( &packet );
+                    skipThisFrame = 1;
+                    //continue;
                 }
             }
-            myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet );
+            myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, frameTime, skipThisFrame );
             if( jpeg ) {
                 if( mode == 0 ) {
                     if( frameCount == 2 ) write_jpeg( jpeg, "test.jpg" );
@@ -547,7 +568,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     packet.data = NULL;
     packet.size = 0;
     
-    myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet );
+    myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, 0, 1 );
     if( mode == 1 ) myzmq__send_jpeg( jpeg, zmqOut );
     else if( mode == 2 ) mynano__send_jpeg( jpeg, nanoOut );
     

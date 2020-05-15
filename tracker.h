@@ -4,8 +4,10 @@
 #include<nanomsg/nn.h>
 #include<nanomsg/pipeline.h>
 #include<string.h>
-
+#include<sys/time.h>
+#include "time.h"
 #include "chunk.h"
+#include "ujsonin/ujsonin.h"
 
 void chunk__dump( chunk *c );
 char chunk__isheader( chunk *c );
@@ -90,9 +92,33 @@ chunk *myzmq__recv_chunk( myzmq *z ) {
 void chunk__del( chunk *c ) {
     if( !c ) return;
     if( c->dtype == 0 ) free( c->data );
-    if( c->dtype == 1 ) nn_freemsg( c->data );
+    if( c->dtype == 1 ) nn_freemsg( c->rawptr );
     if( c->dtype == 2 ) free( c->data );
     free( c );
+}
+
+uint32_t antol( char *str, int len ) {
+    char *dup = strndup( str, len );
+    uint32_t res = atol( dup );
+    free( dup );
+    return res;
+}
+
+uint32_t nodetol( node_str *node ) {
+    if( !node ) return 0;
+    return antol( node->str, node->len );
+}
+
+uint64_t antoll( char *str, int len ) {
+    char *dup = strndup( str, len );
+    uint64_t res = atoll( dup );
+    free( dup );
+    return res;
+}
+
+uint64_t nodetoll( node_str *node ) {
+    if( !node ) return 0;
+    return antoll( node->str, node->len );
 }
 
 chunk *mynano__recv_chunk( int n ) {
@@ -104,9 +130,41 @@ chunk *mynano__recv_chunk( int n ) {
     //printf("Received nanomsg chunk of size %i\n", size );
     
     chunk *c = calloc( sizeof( chunk ), 1 );
-    c->size = size;
-    c->data = buf;
-    c->type = buf[4];
+    //c->size = size;
+    
+    uint16_t jsonLen = * ( (uint16_t *) buf );
+    //printf("Size: %i, JSON: %.*s\n", size, jsonLen, &buf[3] );
+    
+    uint16_t dataStart = jsonLen + 2;
+    
+    int err = 0;
+    node_hash *root = parse( &buf[3], jsonLen, NULL, &err );
+    if( !err ) {
+        node_str *nalBytesNode = ( node_str * ) node_hash__get( root, "nalBytes", 8 );
+        uint32_t nalBytes = nodetol( nalBytesNode );
+        if( nalBytes && nalBytes != ( size - dataStart ) ) {
+            printf("JSON size doesn't match data payload; %li != %li\n", (long) nalBytes, (long) size - dataStart );
+        }
+        node_str *timeNode = (node_str *) node_hash__get( root, "time", 4 );
+        if( timeNode ) {
+            uint64_t time = nodetoll( timeNode );
+            c->time = time;
+            uint64_t now = now_msec();
+            long dif = now_msec() - time;
+            //printf("Time str: %.*s\n", timeNode->len, timeNode->str );
+            //printf("MS dif: %lli %lli %li\n", (long long) time, (long long) now, dif );
+        }
+        else {
+            printf("JSON has no time node\n");
+        }
+        node_hash__delete( root );
+    }
+    
+    
+    c->size = size - dataStart;
+    c->rawptr = buf;
+    c->data = &buf[ dataStart ];
+    c->type = buf[ 4 + dataStart ];
     c->dtype = 1;
     //printf("%x %x %x %x %x\n", buffer[0], buffer[1], buffer[2], buffer[3], buffer[4] );
     chunk__dump( c );
@@ -264,7 +322,7 @@ int tracker__mynano__recv_frame( chunk_tracker *tracker, int n ) {
     return 0;
 }
 
-int tracker__mynano__recv_frame_non_header( chunk_tracker *tracker, int n ) {
+int tracker__mynano__recv_frame_non_header( chunk_tracker *tracker, int n, uint64_t *time ) {
     while( 1 ) {
         chunk *c = mynano__recv_chunk( n );
         if( !c ) {
@@ -272,6 +330,7 @@ int tracker__mynano__recv_frame_non_header( chunk_tracker *tracker, int n ) {
             return 0;
         }
         if( chunk__isheader( c ) ) continue;
+        if(time) *time = c->time;
         tracker__add_chunk( tracker, c );
         return 1;
     }

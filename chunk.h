@@ -9,7 +9,9 @@ struct chunk_s {
     char type;
     char easyType;
     char *data;
+    char *rawptr;
     uint32_t size;
     chunk *next;
     int dtype;
+    uint64_t time;
 };
