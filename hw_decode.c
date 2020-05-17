@@ -87,7 +87,58 @@ int skip_frame( AVCodecContext *avctx, AVPacket *packet ) {
     return 0;
 }
 
-myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *packet, uint64_t frameTime, char skip ) {
+const uint8_t difmap[ 17 ] = {
+  0, // -16
+  1, // -32
+  3, // -48
+  10, // -64
+  10, // -80
+  20, // -96
+  20, // -112
+  40, // -128
+  40, // -144
+  80, // -160
+  80, // -176
+  160, // -192
+  160, // 208 
+  255, // 224
+  255, // 240
+  255, // 256
+  255
+};
+
+char frameDif( AVFrame *f1, AVFrame *f2 ) {
+    int w = f1->width*3;
+    int h = f1->height;
+    int l1 = f1->linesize[0];
+    uint64_t totDif = 0;
+    for( int y=0;y<h;y++ ) {
+        if( y%3 ) continue;
+        int lstart = l1 * y;
+        uint8_t *d1 = f1->data[0] + lstart;
+        uint8_t *d2 = f2->data[0] + lstart;
+        for( int x=0;x<w;x+=9,d1+=9,d2+=9 ) {
+            uint8_t r1 = *d1;
+            uint8_t g1 = *(d1+1);
+            uint8_t b1 = *(d1+2);
+            uint8_t r2 = *d2;
+            uint8_t g2 = *(d2+1);
+            uint8_t b2 = *(d2+2);
+            
+            uint8_t dr = abs( r1-r2 ) >> 4; 
+            uint8_t dg = abs( g1-g2 ) >> 4;
+            uint8_t db = abs( b1-b2 ) >> 4;
+            
+            totDif += difmap[dr] + difmap[dg] + difmap[db];
+        }
+        if( totDif > 2500 ) return 1;
+    }
+    //printf("dif: %lli\n", (long long ) totDif );
+    if( totDif > 2500 ) return 1;
+    return 0;
+}
+
+myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *packet, uint64_t frameTime, char skip, AVFrame **prevframe ) {
     int size;
     int ret = avcodec_send_packet(avctx, packet);
     if (ret < 0) {
@@ -109,7 +160,7 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
     if( skip ) {
         uint64_t now = now_msec();
         uint64_t dif = now - frameTime;
-        printf("MS till drop: %lli\n", (long long) dif );
+        //printf("MS till drop: %lli\n", (long long) dif );
         if( frame ) av_frame_free(&frame);
         if( frame2 ) av_frame_free(&frame2);
         return NULL;
@@ -148,14 +199,26 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
     
     sws_freeContext( sws_ctx );
     
+    if( *prevframe ) {
+        if( !frameDif( frame3, *prevframe ) ) {
+            if( frame ) av_frame_free(&frame);
+            if( frame2 ) av_frame_free(&frame2);
+            av_frame_free( &frame3 );
+            //printf("Unchanged\n");
+            return NULL;
+        }
+        av_frame_free( prevframe );
+    }
+    *prevframe = frame3;
+    
     myjpeg *jpeg = raw_to_jpeg( compressor, (unsigned char *) frame3->data[0], w, h, "test.jpg", frame3->linesize[0] );
     if( frame ) av_frame_free(&frame);
     if( frame2 ) av_frame_free(&frame2);
-    if( frame3 ) av_frame_free( &frame3 );
+    //if( frame3 ) av_frame_free( &frame3 );
     
     uint64_t now = now_msec();
     uint64_t dif = now - frameTime;
-    printf("MS till jpeg: %lli\n", (long long) dif );
+    //printf("MS till jpeg: %lli\n", (long long) dif );
     
     return jpeg;
     
@@ -509,6 +572,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     
     int frameCount = 0;
     uint64_t frameTime;
+    AVFrame *prevframe = NULL;
     while( ret >= 0 ) {
         if( frameCount > 0 ) {
             if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
@@ -537,7 +601,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
                     //continue;
                 }
             }
-            myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, frameTime, skipThisFrame );
+            myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, frameTime, skipThisFrame, &prevframe );
             if( jpeg ) {
                 if( mode == 0 ) {
                     if( frameCount == 2 ) write_jpeg( jpeg, "test.jpg" );
@@ -568,7 +632,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     packet.data = NULL;
     packet.size = 0;
     
-    myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, 0, 1 );
+    myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, 0, 1, NULL );
     if( mode == 1 ) myzmq__send_jpeg( jpeg, zmqOut );
     else if( mode == 2 ) mynano__send_jpeg( jpeg, nanoOut );
     
