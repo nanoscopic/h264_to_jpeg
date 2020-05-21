@@ -620,25 +620,26 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     
     int srcw, srch;
     
-    if( mode == 2 ) {
-        for( int j=0;j<20;j++ ) {
-            tracker__mynano__recv_frame_non_header( tracker, nanoIn, &frameTime );
-            if( ( ret = av_read_frame( input_ctx, &packet ) ) < 0 ) break;
-            if( video_stream != packet.stream_index ) { av_packet_unref(&packet); continue; }
-            get_frame_size( decoder_ctx, &packet, &srcw, &srch );
-            printf("Source dimensions %i x %i\n", srcw, srch );
-            break;
-        }
-        if( !dw && !dh ) {
-            dw = srcw;
-            dh = srch;
-        }
-        if( dh > 1000 ) {
-            dw /= 2;
-            dh /= 2;
-        }
-        printf("Target dimensions %i x %i\n", dw, dh );
+    for( int j=0;j<20;j++ ) {
+        if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
+        else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
+        else if( mode == 2 ) tracker__mynano__recv_frame_non_header( tracker, nanoIn, &frameTime );
+            
+        if( ( ret = av_read_frame( input_ctx, &packet ) ) < 0 ) break;
+        if( video_stream != packet.stream_index ) { av_packet_unref(&packet); continue; }
+        get_frame_size( decoder_ctx, &packet, &srcw, &srch );
+        printf("Source dimensions %i x %i\n", srcw, srch );
+        break;
     }
+    if( !dw && !dh ) {
+        dw = srcw;
+        dh = srch;
+    }
+    if( dh > 1000 ) {
+        dw /= 2;
+        dh /= 2;
+    }
+    printf("Target dimensions %i x %i\n", dw, dh );
     
     while( ret >= 0 ) {
         if( frameCount > 0 ) {

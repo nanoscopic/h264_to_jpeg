@@ -394,54 +394,112 @@ void chunk__dump( chunk *c ) {
     }
 }
 
+int findseq( char *data, uint32_t len ) {
+    for( uint32_t i=0;i<=(len-4);i++ ) { // len-1 is last byte ; len-4 is start of last 4 sequence; ex: len-4,len-3,len-2,len-1
+        if( data[ i ] == 0x00 && data[ i+1 ] == 0x00 && data[ i+2 ] == 0x00 && data[ i+3 ] == 0x01 ) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 chunk *read_chunk( FILE *fh ) {
     char m[4];
     int read = fread( m, 4, 1, fh );
     if( !read ) return NULL;
-    if( m[0] == 0x00 && m[1] == 0x00 && m[2] == 0x00 && m[3] == 0x01 ) {
-        unsigned char data[4];
-        fread( data, 4, 1, fh );
-        uint32_t size = (data[3]<<0) | (data[2]<<8) | (data[1]<<16) | (data[0]<<24);
+    if(  m[2] == '{' ) { // b1 = size byte 1, b2 = size byte 2, b3 = {, b4 = first byte of json
+        uint16_t size = * ( ( uint16_t * ) m );
+        char *jsonbuffer = malloc( size );
+        jsonbuffer[0] = '{';
+        jsonbuffer[1] = m[3];
+        fread( jsonbuffer + 2, 1, size - 2, fh );
         
-        char *chunkdata = malloc( size + 4 );
-        chunkdata[0] = 0x00; chunkdata[1] = 0x00; chunkdata[2] = 0x00; chunkdata[3] = 0x01;
-        fread( &chunkdata[4], size, 1, fh );
-        chunk *c = calloc( sizeof( chunk ), 1 );
-        c->data = chunkdata;
-        c->type = chunkdata[4];
-        c->size = size + 4;
-        c->dtype = 0;
-        chunk__dump( c );
-        return c;
+        // handle the JSON
+        
+        fread( m, 1, 4, fh );
     }
+    { // this file was written by standard qvh; no JSON header
+        uint32_t buffersize = 2000;
+        uint32_t bufferleft = 2000;
+        uint32_t bufferpos = 4;
+        int increment = 1000;
+        char *buffer = malloc( buffersize );
+        if( m[0] == 0x00 && m[1] == 0x00 && m[2] == 0x00 && m[3] == 0x01 ) {
+            buffer[0] = 0x00;
+            buffer[1] = 0x00;
+            buffer[2] = 0x00;
+            buffer[3] = 0x01;
+            //fread( buffer, 1, 1000, fh );
+            /*bufferpos += 1000;
+            for( int j=0;j<1000;j++ ) {
+                printf("%02x  ", buffer[j] & 0xFF );
+            }*/
+            for( int i=0;i<5000; i++ ) { // limit this loop to increment*5000 = 5 megabytes; no NALU should be that big
+                bufferleft = buffersize - bufferpos;
+                if( bufferleft < ( increment + 3 ) ) {
+                    uint32_t newsize = buffersize * 2;
+                    char *newbuf = malloc( newsize );
+                    memcpy( newbuf, buffer, bufferpos );
+                    free( buffer );
+                    buffer = newbuf;
+                    buffersize *= 2;
+                    //bufferleft = newsize - bufferpos;
+                }
+                size_t readbytes = fread( &buffer[ bufferpos ], 1, increment, fh );
+                if( readbytes < increment ) {
+                    printf("Reached end of file\n");
+                    return NULL;
+                    buffer[ bufferpos + readbytes ] = 0x00;
+                    buffer[ bufferpos + readbytes +1 ] = 0x00;
+                    buffer[ bufferpos + readbytes +2 ] = 0x00;
+                    buffer[ bufferpos + readbytes +3 ] = 0x01;
+                    readbytes += 4;
+                }
+                int seqpos;
+                if( bufferpos ) seqpos = findseq( &buffer[ bufferpos - 3 ], readbytes+3 );
+                else            seqpos = findseq( &buffer[ bufferpos ], readbytes );
+                //if( seqpos != -1 ) printf("seqpos: %i\n", seqpos );
+                
+                if( seqpos == -1 ) {
+                    bufferpos += readbytes;
+                    continue;
+                }
+                // found the sequence; stop
+                if( bufferpos ) {
+                    seqpos -= 3;
+                    bufferpos += seqpos;
+                    // increment - seqpos = data read in we should not have
+                    fseek( fh, - ( readbytes - seqpos ), SEEK_CUR );
+                }
+                else {
+                    bufferpos += seqpos;
+                    fseek( fh, - ( readbytes - seqpos ), SEEK_CUR );
+                }
+                
+                //printf("Size: %lli\n", ( long long ) bufferpos );
+                chunk *c = calloc( sizeof( chunk ), 1 );
+                c->data = buffer;
+                c->type = buffer[4];
+                c->size = bufferpos;
+                c->dtype = 0;
+                chunk__dump( c );
+                return c;
+            }
+        }
+    }
+    
+    
     fprintf(stderr, "not magic; not a good sign\n");
     return NULL;
 }
 
 chunk *read_chunk_non_header( FILE *fh ) {
-    char m[4];
     while( 1 ) {
-        int read = fread( m, 4, 1, fh );
-        if( !read ) return NULL;
-        if( m[0] == 0x00 && m[1] == 0x00 && m[2] == 0x00 && m[3] == 0x01 ) {
-            unsigned char data[4];
-            fread( data, 4, 1, fh );
-            uint32_t size = (data[3]<<0) | (data[2]<<8) | (data[1]<<16) | (data[0]<<24);
-            
-            char *chunkdata = malloc( size + 4 );
-            chunkdata[0] = 0x00; chunkdata[1] = 0x00; chunkdata[2] = 0x00; chunkdata[3] = 0x01;
-            fread( &chunkdata[4], size, 1, fh );
-            chunk *c = calloc( sizeof( chunk ), 1 );
-            c->data = chunkdata;
-            c->type = chunkdata[4];
-            c->size = size + 4;
-            c->dtype = 0;
-            chunk__dump( c );
-            if( !chunk__isheader( c ) ) return c;
-        }
+        chunk *c = read_chunk( fh );
+        if( !c ) return NULL;
+        if( !chunk__isheader( c ) ) return c;
+        chunk__dump( c );
     }
-    // unreachable
-    return NULL;
 }
 
 void chunk__write( chunk *c, FILE *fh ) {
