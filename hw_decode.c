@@ -138,7 +138,31 @@ char frameDif( AVFrame *f1, AVFrame *f2 ) {
     return 0;
 }
 
-myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *packet, uint64_t frameTime, char skip, AVFrame **prevframe ) {
+void get_frame_size( AVCodecContext *avctx, AVPacket *packet, int *w, int *h ) {
+    int size;
+    int ret = avcodec_send_packet(avctx, packet);
+    if (ret < 0) {
+        av_strerror( ret, strErr, 200 );
+        fprintf(stderr, "Error during decoding: %s\n", strErr);
+        return;
+    }
+
+    AVFrame *frame = av_frame_alloc();
+    if( !frame ) {
+        fprintf(stderr, "Can not alloc frame\n");
+        ret = AVERROR(ENOMEM);
+        return;
+    }
+    
+    ret = avcodec_receive_frame(avctx, frame);
+    
+    *w = frame->width;
+    *h = frame->height;
+    
+    av_frame_free(&frame);
+}
+
+myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *packet, uint64_t frameTime, char skip, AVFrame **prevframe, int dw, int dh ) {
     int size;
     int ret = avcodec_send_packet(avctx, packet);
     if (ret < 0) {
@@ -181,21 +205,29 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
     
     int w = frame2->width;
     int h = frame2->height;
+    if( !dw ) {
+        dw = w;
+        dh = h;
+    }
 
     struct SwsContext *sws_ctx = sws_getContext(
         w, h, frame2->format,
-        w, h, AV_PIX_FMT_RGB24,
+        dw, dh, AV_PIX_FMT_RGB24,
         SWS_POINT, NULL, NULL, NULL );
 
     AVFrame *frame3 = av_frame_alloc();
     frame3->format = AV_PIX_FMT_RGB24;
-    frame3->width = w;
-    frame3->height = h;
+    frame3->width = dw;
+    frame3->height = dh;
     av_frame_get_buffer( frame3, 32 );
     
-    sws_scale( sws_ctx,
+    int resultHeight = sws_scale( sws_ctx,
         (const uint8_t *const *) frame2->data, frame2->linesize, 0, h,
         frame3->data, frame3->linesize );
+    
+    if( resultHeight != dh ) {
+        fprintf(stderr, "Result height %i doesn't match destination height %i\n", resultHeight, dh );
+    }
     
     sws_freeContext( sws_ctx );
     
@@ -211,7 +243,7 @@ myjpeg *process_frame( tjhandle compressor, AVCodecContext *avctx, AVPacket *pac
     }
     *prevframe = frame3;
     
-    myjpeg *jpeg = raw_to_jpeg( compressor, (unsigned char *) frame3->data[0], w, h, "test.jpg", frame3->linesize[0] );
+    myjpeg *jpeg = raw_to_jpeg( compressor, (unsigned char *) frame3->data[0], dw, dh, "test.jpg", frame3->linesize[0] );
     if( frame ) av_frame_free(&frame);
     if( frame2 ) av_frame_free(&frame2);
     //if( frame3 ) av_frame_free( &frame3 );
@@ -403,6 +435,8 @@ int main( int argc, char *argv[] ) {
         UOPT("--frameSkip","Frame skip mod; 2=half frames, 3=1/3 frames"),
         UOPT("--cacheid","ID to cache headers under"),
         UOPT("--cachedir","Dir to store cache files in"),
+        UOPT("--dw","Destination width"),
+        UOPT("--dh","Destination height"),
         NULL
     };
     uopt *zmq_options[] = {
@@ -433,6 +467,15 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     if( loopsC ) {
         loops = atoi( loopsC );
         printf("Parsing file %i times\n", loops );
+    }
+    
+    int dw = 0;
+    int dh = 0;
+    char *dwC = ucmd__get( cmd, "--dw" );
+    char *dhC = ucmd__get( cmd, "--dh" );
+    if( dhC && dhC ) {
+        dw = atoi( dwC );
+        dh = atoi( dhC );
     }
   
     // mode 0->file, 1->zmq, 2->nanomsg
@@ -573,6 +616,30 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     int frameCount = 0;
     uint64_t frameTime;
     AVFrame *prevframe = NULL;
+    char wroteJpeg = 0;
+    
+    int srcw, srch;
+    
+    if( mode == 2 ) {
+        for( int j=0;j<20;j++ ) {
+            tracker__mynano__recv_frame_non_header( tracker, nanoIn, &frameTime );
+            if( ( ret = av_read_frame( input_ctx, &packet ) ) < 0 ) break;
+            if( video_stream != packet.stream_index ) { av_packet_unref(&packet); continue; }
+            get_frame_size( decoder_ctx, &packet, &srcw, &srch );
+            printf("Source dimensions %i x %i\n", srcw, srch );
+            break;
+        }
+        if( !dw && !dh ) {
+            dw = srcw;
+            dh = srch;
+        }
+        if( dh > 1000 ) {
+            dw /= 2;
+            dh /= 2;
+        }
+        printf("Target dimensions %i x %i\n", dw, dh );
+    }
+    
     while( ret >= 0 ) {
         if( frameCount > 0 ) {
             if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
@@ -601,17 +668,28 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
                     //continue;
                 }
             }
-            myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, frameTime, skipThisFrame, &prevframe );
+            myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, frameTime, skipThisFrame, &prevframe, dw, dh );
             if( jpeg ) {
                 if( mode == 0 ) {
-                    if( frameCount == 2 ) write_jpeg( jpeg, "test.jpg" );
+                    if( !wroteJpeg ) {
+                        write_jpeg( jpeg, "test.jpg" );
+                        wroteJpeg = 1;
+                    }
                     else {
                         tjFree( jpeg->data );
                         free( jpeg );
                     }
                 }
                 if( mode == 1 ) myzmq__send_jpeg( jpeg, zmqOut );
-                else if( mode == 2 ) mynano__send_jpeg( jpeg, nanoOut );
+                else if( mode == 2 ) {
+                    if( !nanoOut && !wroteJpeg ) {
+                        write_jpeg( jpeg, "test.jpg" );
+                        wroteJpeg = 1;
+                    }
+                    else {
+                        mynano__send_jpeg( jpeg, nanoOut );
+                    }
+                }
             }
         }
         
@@ -632,7 +710,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     packet.data = NULL;
     packet.size = 0;
     
-    myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, 0, 1, NULL );
+    myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, 0, 1, NULL, 0, 0 );
     if( mode == 1 ) myzmq__send_jpeg( jpeg, zmqOut );
     else if( mode == 2 ) mynano__send_jpeg( jpeg, nanoOut );
     
