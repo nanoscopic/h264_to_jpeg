@@ -212,17 +212,6 @@ void tracker__add_chunk( chunk_tracker *tracker, chunk *c ) {
     curchunk->next = c;
 }
 
-void tracker__read_headers( chunk_tracker *tracker, FILE *fh ) {
-    int done = 0; 
-    while( !done ) {
-        chunk *c = read_chunk( fh );
-        if( !c ) break;
-        
-        if( c->type == 6 ) done = 1; // 6 = SEI
-        tracker__add_chunk( tracker, c );
-    }
-}
-
 void chunk__write( chunk *c, FILE *fh );
 
 void tracker__write_file( chunk_tracker *tracker, FILE *fh ) {
@@ -254,16 +243,45 @@ void tracker__mynano__send_chunks( chunk_tracker *tracker, int n ) {
     tracker->pos = 0;
 }
 
-void tracker__myzmq__recv_headers( chunk_tracker *tracker, myzmq *z ) {
-    int done = 0;
-    while( !done ) {
+char tracker__read_headers( chunk_tracker *tracker, FILE *fh ) {
+    char gotSei = 0;
+    char gotSps = 0;
+    char gotPps = 0;
+    for( int i=0;i<10;i++ ) {
+        chunk *c = read_chunk( fh );
+        if( !c ) return 0;
+        
+        if( c->easyType == 6      ) { gotSei = 1; tracker__add_chunk( tracker, c ); }
+        else if( c->easyType == 7 ) { gotSps = 1; tracker__add_chunk( tracker, c ); }
+        else if( c->easyType == 8 ) { gotPps = 1; tracker__add_chunk( tracker, c ); }
+        else {
+            printf("Got chunk type %i while trying to receive headers\n", c->easyType );
+            return 0;
+        }
+        
+        if( gotSei && gotSps && gotPps ) return 1;
+    }
+    return 0;
+}
+
+char tracker__myzmq__recv_headers( chunk_tracker *tracker, myzmq *z ) {
+    char gotSei = 0;
+    char gotSps = 0;
+    char gotPps = 0;
+    for( int i=0;i<10;i++ ) {
         chunk *c = myzmq__recv_chunk( z );
         if( !c ) break;
         if( c->type == 0 ) continue; // dummy chunk to initialize zmq
         
-        if( c->type == 6 ) done = 1;
+        if( c->easyType == 6 ) gotSei = 1;
+        else if( c->easyType == 7 ) gotSps = 1;
+        else if( c->easyType == 8 ) gotPps = 1;
+        
         tracker__add_chunk( tracker, c );
+        
+        if( gotSei && gotSps && gotPps ) return 1;
     }
+    return 0;
 }
 
 
@@ -274,9 +292,9 @@ char tracker__mynano__recv_headers( chunk_tracker *tracker, int n ) {
     char gotSei = 0;
     char gotSps = 0;
     char gotPps = 0;
-    while( !gotSei || !gotSps || !gotPps ) {
+    for( int i=0;i<10;i++ ) {
         chunk *c = mynano__recv_chunk( n );
-        if( !c ) break;
+        if( !c ) return 0;
         if( c->type == 0 ) continue; // dummy chunk to initialize zmq
         
         if( c->easyType == 6 ) gotSei = 1;
@@ -287,8 +305,9 @@ char tracker__mynano__recv_headers( chunk_tracker *tracker, int n ) {
             return 0;
         }
         tracker__add_chunk( tracker, c );
+        if( gotSei && gotSps && gotPps ) return 1;
     }
-    return 1;
+    return 0;
 }
 
 int tracker__read_frame( chunk_tracker *tracker, FILE *fh ) {
@@ -414,11 +433,30 @@ chunk *read_chunk( FILE *fh ) {
         jsonbuffer[1] = m[3];
         fread( jsonbuffer + 2, 1, size - 2, fh );
         
+        //printf("JSON:%.*s\n", size, jsonbuffer );
         // handle the JSON
-        
-        fread( m, 1, 4, fh );
+        int err = 0;
+        node_hash *root = parse( jsonbuffer, size, NULL, &err );
+        if( !err ) {
+            node_str *nalBytesNode = ( node_str * ) node_hash__get( root, "nalBytes", 8 );
+            uint32_t nalBytes = nodetol( nalBytesNode );
+            node_hash__delete( root );
+            //printf("nal bytes: %lli\n", (long long) nalBytes );
+            
+            char *naldata = malloc( nalBytes );
+            fread( naldata, 1, nalBytes, fh );
+            
+            chunk *c = calloc( sizeof( chunk ), 1 );
+            c->data = naldata;
+            c->type = naldata[4];
+            c->size = nalBytes;
+            c->dtype = 0;
+            chunk__dump( c );
+            return c;
+        }
+        return NULL;
     }
-    { // this file was written by standard qvh; no JSON header
+    else { // this file was written by standard qvh; no JSON header
         uint32_t buffersize = 2000;
         uint32_t bufferleft = 2000;
         uint32_t bufferpos = 4;
@@ -429,11 +467,6 @@ chunk *read_chunk( FILE *fh ) {
             buffer[1] = 0x00;
             buffer[2] = 0x00;
             buffer[3] = 0x01;
-            //fread( buffer, 1, 1000, fh );
-            /*bufferpos += 1000;
-            for( int j=0;j<1000;j++ ) {
-                printf("%02x  ", buffer[j] & 0xFF );
-            }*/
             for( int i=0;i<5000; i++ ) { // limit this loop to increment*5000 = 5 megabytes; no NALU should be that big
                 bufferleft = buffersize - bufferpos;
                 if( bufferleft < ( increment + 3 ) ) {
@@ -446,21 +479,17 @@ chunk *read_chunk( FILE *fh ) {
                     //bufferleft = newsize - bufferpos;
                 }
                 size_t readbytes = fread( &buffer[ bufferpos ], 1, increment, fh );
+                char fileend = 0;
                 if( readbytes < increment ) {
                     printf("Reached end of file\n");
-                    return NULL;
-                    buffer[ bufferpos + readbytes ] = 0x00;
-                    buffer[ bufferpos + readbytes +1 ] = 0x00;
-                    buffer[ bufferpos + readbytes +2 ] = 0x00;
-                    buffer[ bufferpos + readbytes +3 ] = 0x01;
-                    readbytes += 4;
+                    fileend = 1;
                 }
                 int seqpos;
                 if( bufferpos ) seqpos = findseq( &buffer[ bufferpos - 3 ], readbytes+3 );
                 else            seqpos = findseq( &buffer[ bufferpos ], readbytes );
                 //if( seqpos != -1 ) printf("seqpos: %i\n", seqpos );
                 
-                if( seqpos == -1 ) {
+                if( seqpos == -1 && !fileend ) {
                     bufferpos += readbytes;
                     continue;
                 }
@@ -488,31 +517,30 @@ chunk *read_chunk( FILE *fh ) {
         }
     }
     
-    
     fprintf(stderr, "not magic; not a good sign\n");
     return NULL;
 }
 
 chunk *read_chunk_non_header( FILE *fh ) {
-    while( 1 ) {
+    for( int i=0;i<10;i++ ) {
         chunk *c = read_chunk( fh );
         if( !c ) return NULL;
-        if( !chunk__isheader( c ) ) return c;
-        chunk__dump( c );
+        if( !chunk__isheader( c ) ) {
+            //chunk__dump( c );
+            return c;
+        }
     }
+    return NULL;
 }
 
 void chunk__write( chunk *c, FILE *fh ) {
-    char m[4] = { 0,0,0,0x01 };
-    fwrite( m, 1, 4, fh );
-    char sz[4];
     long int datasize = c->size;
-    sz[0] = ( datasize & 0xFF000000 ) >> 24;
-    sz[1] = ( datasize & 0x00FF0000 ) >> 16;
-    sz[2] = ( datasize & 0x0000FF00 ) >> 8;
-    sz[3] = datasize & 0xFF;
-    fwrite( sz, 1, 4, fh );
-    fwrite( &c->data[4], 1, datasize, fh );  
+    char jbuf[1000];
+    int jlen = snprintf(jbuf,1000,"{\"nalBytes\":%lli,\"time\":0}",(long long) datasize);
+    uint16_t jlen2 = jlen;
+    fwrite( &jlen2, 2, 1, fh );
+    fwrite( jbuf, 1, jlen, fh );
+    fwrite( c->data, 1, datasize, fh );  
 }
 
 chunk_tracker *tracker__new() {

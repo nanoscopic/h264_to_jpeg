@@ -427,6 +427,10 @@ int main( int argc, char *argv[] ) {
     uopt *file_options[] = {
         UOPT_REQUIRED("--file","File to process"),
         UOPT("--loops","Number of times to loop through the file"),
+        UOPT("--cacheid","ID to cache headers under"),
+        UOPT("--cachedir","Dir to store cache files in"),
+        UOPT("--dw","Destination width"),
+        UOPT("--dh","Destination height"),
         NULL
     };
     uopt *nano_options[] = {
@@ -494,36 +498,43 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     
     char usedCache = 0;
     printf("Fetching headers to start decoder\n");
-    if( mode == 0 ) tracker__read_headers( tracker, fh );
-    else if( mode == 1 ) tracker__myzmq__recv_headers( tracker, zmqIn );
-    else if( mode == 2 ) {
-        char *cacheId = ucmd__get( cmd, "--cacheid" );
-        if( !cacheId ) tracker__mynano__recv_headers( tracker, nanoIn );
+    
+    char *cacheId = ucmd__get( cmd, "--cacheid" );
+        
+    if( !cacheId ) {
+        if( mode == 0 ) tracker__read_headers( tracker, fh );
+        else if( mode == 1 ) tracker__myzmq__recv_headers( tracker, zmqIn );
+        else if( mode == 2 ) tracker__mynano__recv_headers( tracker, nanoIn );
+    }
+    else {
+        char *cacheDir = ucmd__get( cmd, "--cachedir" );
+        if( !cacheDir ) cacheDir = "cache";
+        char cacheFile[100];
+        snprintf( cacheFile, 100, "%s/%s", cacheDir, cacheId );
+        if( access( cacheFile, F_OK ) != -1 ) {
+            printf("Using cached headers from %s\n", cacheFile );
+            // cache exists; use it
+            FILE *fh = fopen( cacheFile, "rb" );
+            tracker__read_headers( tracker, fh );
+            fclose( fh );
+            usedCache = 1;
+        }
         else {
-            char *cacheDir = ucmd__get( cmd, "--cachedir" );
-            if( !cacheDir ) cacheDir = "cache";
-            char cacheFile[100];
-            snprintf( cacheFile, 100, "%s/%s", cacheDir, cacheId );
-            if( access( cacheFile, F_OK ) != -1 ) {
-                printf("Using cached headers from %s\n", cacheFile );
-                // cache exists; use it
-                FILE *fh = fopen( cacheFile, "rb" );
-                tracker__read_headers( tracker, fh );
-                fclose( fh );
-                usedCache = 1;
+            // cache doesn't exist; read headers then store them
+            printf("Caching headers at %s\n", cacheFile );
+            char res = 0;
+            
+            if( mode == 0 ) res = tracker__read_headers( tracker, fh );
+            else if( mode == 1 ) res = tracker__myzmq__recv_headers( tracker, zmqIn );
+            else if( mode == 2 ) res = tracker__mynano__recv_headers( tracker, nanoIn );
+            
+            if( res == 0 ) {
+                fprintf(stderr,"Did not recieve headers; cannot continue\n");
+                exit(1);
             }
-            else {
-                // cache doesn't exist; read headers then store them
-                printf("Caching headers at %s\n", cacheFile );
-                char res = tracker__mynano__recv_headers( tracker, nanoIn );
-                if( res == 0 ) {
-                    fprintf(stderr,"Did not recieve headers; cannot continue\n");
-                    exit(1);
-                }
-                FILE *fh = fopen( cacheFile, "wb+" );
-                tracker__write_file( tracker, fh );
-                fclose( fh );
-            }
+            FILE *fh = fopen( cacheFile, "wb+" );
+            tracker__write_file( tracker, fh );
+            fclose( fh );
         }
     }
     
@@ -546,8 +557,14 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     int gotframe = 1;
     
     printf("Fetching first frame to initialize decoder\n");
-    if( mode == 0 ) gotframe = tracker__read_frame( tracker, fh );
-    else if( mode == 1 ) tracker__myzmq__recv_frame( tracker, zmqIn );
+    
+    if( mode == 0 ) {
+        gotframe = tracker__read_frame( tracker, fh ); // receives a non header frame
+    }
+    else if( mode == 1 ) {
+        // todo fix for cache
+        tracker__myzmq__recv_frame( tracker, zmqIn );
+    }
     else if( mode == 2 ) {
         if( usedCache ) tracker__mynano__recv_frame_non_header( tracker, nanoIn, NULL );
         else tracker__mynano__recv_frame( tracker, nanoIn );
