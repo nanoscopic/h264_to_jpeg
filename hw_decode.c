@@ -291,13 +291,24 @@ void write_jpeg( myjpeg *jpeg, char *filename ) {
 }
 
 void myzmq__send_jpeg( myjpeg *jpeg, myzmq *dest ) {
-    if( dest ) myzmq__send( dest, jpeg->data, jpeg->size );
+    if( dest ) {
+        myzmq__send( dest, jpeg->data, jpeg->size );
+    }
     tjFree( jpeg->data );
     free( jpeg );
 }
 
-void mynano__send_jpeg( myjpeg *jpeg, int n ) {
-    if(n) mynano__send( n, jpeg->data, jpeg->size );
+void mynano__send_jpeg( myjpeg *jpeg, int n, int ow, int oh, int dw, int dh ) {
+    if(n) {
+        char buffer[200];
+        int jlen = snprintf( buffer, 200, "{\"ow\":%i,\"oh\":%i,\"dw\":%i,\"dh\":%i}", ow, oh, dw, dh );
+        long unsigned int totlen = jpeg->size + jlen;
+        char *both = malloc( totlen );
+        memcpy( both, buffer, jlen );
+        memcpy( &both[jlen], jpeg->data, jpeg->size );
+        mynano__send( n, both, totlen );
+        free( both );
+    }
     tjFree( jpeg->data );
     free( jpeg );
 }
@@ -711,7 +722,7 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
                         wroteJpeg = 1;
                     }
                     else {
-                        mynano__send_jpeg( jpeg, nanoOut );
+                        mynano__send_jpeg( jpeg, nanoOut, srcw, srch, dw, dh );
                     }
                 }
             }
@@ -735,8 +746,8 @@ int run_stream( ucmd *cmd, int mode, int nanoIn, int nanoOut, myzmq *zmqIn, myzm
     packet.size = 0;
     
     myjpeg *jpeg = process_frame( compressor, decoder_ctx, &packet, 0, 1, NULL, 0, 0, 0 );
-    if( mode == 1 ) myzmq__send_jpeg( jpeg, zmqOut );
-    else if( mode == 2 ) mynano__send_jpeg( jpeg, nanoOut );
+    //if( mode == 1 ) myzmq__send_jpeg( jpeg, zmqOut );
+    //else if( mode == 2 ) mynano__send_jpeg( jpeg, nanoOut );
     
     tjDestroy(compressor);
     
