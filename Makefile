@@ -13,7 +13,7 @@ send: send_video.c tracker.h chunk.h
 	gcc send_video.c ujsonin/ujsonin.c ujsonin/red_black_tree.c ujsonin/string-tree.c -lzmq -lnanomsg -o send
 
 ffmpeg-for-h264_to_jpeg.tgz:
-	wget https://github.com/nanoscopic/ffmpeg/releases/download/v1.0/ffmpeg-for-h264_to_jpeg.tgz
+	wget https://github.com/nanoscopic/ffmpeg/releases/download/v1.0/ffmpeg-for-h264_to_jpeg.tgz --no-check-certificate
 
 ffmpeg: ffmpeg-for-h264_to_jpeg.tgz
 	mkdir ffmpeg
